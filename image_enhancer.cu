@@ -1,9 +1,12 @@
 // image_enhancer.cu
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
 // Download dari: https://github.com/nothings/stb
 #define STB_IMAGE_IMPLEMENTATION
@@ -24,6 +27,90 @@
         } \
     } while(0)
 
+static void printUsage(FILE* stream, const char* programName) {
+    fprintf(stream, "Cara penggunaan:\n");
+    fprintf(stream, "  %s <input_gambar> <output_gambar>\n\n", programName);
+    fprintf(stream, "  %s <input_gambar> <output_gambar> <sharpen> <denoise> <contrast>\n\n", programName);
+    fprintf(stream, "Contoh:\n");
+    fprintf(stream, "  %s foto.jpg foto_enhanced.png\n", programName);
+    fprintf(stream, "  %s foto.jpg hasil.png 2.0 50 1.5\n\n", programName);
+    fprintf(stream, "Keterangan parameter opsional:\n");
+    fprintf(stream, "  sharpen  >= 0.0\n");
+    fprintf(stream, "  denoise  >  0.0\n");
+    fprintf(stream, "  contrast >  0.0\n\n");
+}
+
+static int parseFloatArgument(const char* valueStr, const char* name,
+                              float minValue, int minInclusive, float* outValue) {
+    char* endPtr = NULL;
+    errno = 0;
+
+    float value = strtof(valueStr, &endPtr);
+    if (valueStr[0] == '\0' || endPtr == valueStr) {
+        fprintf(stderr, "ERROR: Parameter '%s' harus berupa angka.\n", name);
+        return 0;
+    }
+
+    while (*endPtr != '\0' && isspace((unsigned char)*endPtr)) {
+        endPtr++;
+    }
+
+    if (errno == ERANGE || *endPtr != '\0' || !isfinite(value)) {
+        fprintf(stderr, "ERROR: Parameter '%s' tidak valid atau di luar rentang float.\n", name);
+        return 0;
+    }
+
+    if ((minInclusive && value < minValue) || (!minInclusive && value <= minValue)) {
+        fprintf(stderr, "ERROR: Parameter '%s' harus %s %.2f.\n",
+                name, minInclusive ? ">=" : ">", minValue);
+        return 0;
+    }
+
+    *outValue = value;
+    return 1;
+}
+
+static int initializeCudaOrReport(void) {
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+
+    if (err == cudaErrorNoDevice) {
+        fprintf(stderr, "ERROR: Tidak ada GPU yang mendukung CUDA.\n");
+        fprintf(stderr, "Pastikan driver NVIDIA aktif dan device CUDA tersedia.\n");
+        return 0;
+    }
+
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ERROR: Gagal menginisialisasi CUDA: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    if (deviceCount == 0) {
+        fprintf(stderr, "ERROR: Tidak ada GPU yang mendukung CUDA.\n");
+        fprintf(stderr, "Pastikan driver NVIDIA aktif dan device CUDA tersedia.\n");
+        return 0;
+    }
+
+    err = cudaSetDevice(0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ERROR: Gagal memilih device CUDA 0: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    cudaDeviceProp prop;
+    err = cudaGetDeviceProperties(&prop, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ERROR: Gagal membaca properti device CUDA: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    printf("GPU CUDA terdeteksi: %s\n\n", prop.name);
+    return 1;
+}
+
 // Kernel untuk sharpening (unsharp mask)
 __global__ void unsharpMaskKernel(unsigned char* input, unsigned char* output, 
                                    int width, int height, int channels, float amount) {
@@ -41,9 +128,21 @@ __global__ void unsharpMaskKernel(unsigned char* input, unsigned char* output,
         {0.003765, 0.015019, 0.023792, 0.015019, 0.003765}
     };
     
-    for (int c = 0; c < channels; c++) {
+    int pixelBase = (y * width + x) * channels;
+    int processedChannels = channels;
+    int alphaIndex = -1;
+
+    if (channels == 2) {
+        processedChannels = 1;
+        alphaIndex = 1;
+    } else if (channels == 4) {
+        processedChannels = 3;
+        alphaIndex = 3;
+    }
+
+    for (int c = 0; c < processedChannels; c++) {
         float blurred = 0.0f;
-        float original = input[(y * width + x) * channels + c];
+        float original = input[pixelBase + c];
         
         // Apply Gaussian blur
         for (int ky = -2; ky <= 2; ky++) {
@@ -56,7 +155,11 @@ __global__ void unsharpMaskKernel(unsigned char* input, unsigned char* output,
         
         // Unsharp mask formula
         float sharp = original + amount * (original - blurred);
-        output[(y * width + x) * channels + c] = (unsigned char)fminf(fmaxf(sharp, 0.0f), 255.0f);
+        output[pixelBase + c] = (unsigned char)fminf(fmaxf(sharp, 0.0f), 255.0f);
+    }
+
+    if (alphaIndex >= 0) {
+        output[pixelBase + alphaIndex] = input[pixelBase + alphaIndex];
     }
 }
 
@@ -73,10 +176,22 @@ __global__ void bilateralFilterKernel(unsigned char* input, unsigned char* outpu
     float twoSigmaSpaceSq = 2.0f * sigmaSpace * sigmaSpace;
     float twoSigmaColorSq = 2.0f * sigmaColor * sigmaColor;
     
-    for (int c = 0; c < channels; c++) {
+    int pixelBase = (y * width + x) * channels;
+    int processedChannels = channels;
+    int alphaIndex = -1;
+
+    if (channels == 2) {
+        processedChannels = 1;
+        alphaIndex = 1;
+    } else if (channels == 4) {
+        processedChannels = 3;
+        alphaIndex = 3;
+    }
+
+    for (int c = 0; c < processedChannels; c++) {
         float sum = 0.0f;
         float wsum = 0.0f;
-        float centerVal = input[(y * width + x) * channels + c];
+        float centerVal = input[pixelBase + c];
         
         for (int ky = -radius; ky <= radius; ky++) {
             for (int kx = -radius; kx <= radius; kx++) {
@@ -93,7 +208,11 @@ __global__ void bilateralFilterKernel(unsigned char* input, unsigned char* outpu
             }
         }
         
-        output[(y * width + x) * channels + c] = (unsigned char)(sum / wsum);
+        output[pixelBase + c] = (unsigned char)(sum / wsum);
+    }
+
+    if (alphaIndex >= 0) {
+        output[pixelBase + alphaIndex] = input[pixelBase + alphaIndex];
     }
 }
 
@@ -105,12 +224,28 @@ __global__ void contrastEnhanceKernel(unsigned char* input, unsigned char* outpu
     
     if (x >= width || y >= height) return;
     
-    for (int c = 0; c < channels; c++) {
-        float val = input[(y * width + x) * channels + c];
+    int pixelBase = (y * width + x) * channels;
+    int processedChannels = channels;
+    int alphaIndex = -1;
+
+    if (channels == 2) {
+        processedChannels = 1;
+        alphaIndex = 1;
+    } else if (channels == 4) {
+        processedChannels = 3;
+        alphaIndex = 3;
+    }
+
+    for (int c = 0; c < processedChannels; c++) {
+        float val = input[pixelBase + c];
         float mean = 127.5f;
         float enhanced = mean + clipLimit * (val - mean);
         
-        output[(y * width + x) * channels + c] = (unsigned char)fminf(fmaxf(enhanced, 0.0f), 255.0f);
+        output[pixelBase + c] = (unsigned char)fminf(fmaxf(enhanced, 0.0f), 255.0f);
+    }
+
+    if (alphaIndex >= 0) {
+        output[pixelBase + alphaIndex] = input[pixelBase + alphaIndex];
     }
 }
 
@@ -182,17 +317,12 @@ int main(int argc, char** argv) {
     printf("==============================================\n");
     printf("   CUDA Image Quality Enhancer v1.0\n");
     printf("==============================================\n\n");
+    fflush(stdout);
     
     // Cek argumen
-    if (argc < 3) {
-        printf("Cara penggunaan:\n");
-        printf("  %s <input_gambar> <output_gambar>\n\n", argv[0]);
-        printf("Contoh:\n");
-        printf("  %s foto.jpg foto_enhanced.png\n", argv[0]);
-        printf("  %s gambar.png hasil.jpg\n\n", argv[0]);
-        printf("Parameter opsional:\n");
-        printf("  %s <input> <output> <sharpen> <denoise> <contrast>\n", argv[0]);
-        printf("  Contoh: %s foto.jpg hasil.png 2.0 50 1.5\n\n", argv[0]);
+    if (argc != 3 && argc != 6) {
+        fprintf(stderr, "ERROR: Jumlah argumen tidak valid.\n\n");
+        printUsage(stderr, argv[0]);
         return 1;
     }
     
@@ -201,10 +331,18 @@ int main(int argc, char** argv) {
     float denoiseAmount = 30.0f;
     float contrastFactor = 1.2f;
     
-    if (argc >= 6) {
-        sharpenAmount = atof(argv[3]);
-        denoiseAmount = atof(argv[4]);
-        contrastFactor = atof(argv[5]);
+    if (argc == 6) {
+        if (!parseFloatArgument(argv[3], "sharpen", 0.0f, 1, &sharpenAmount) ||
+            !parseFloatArgument(argv[4], "denoise", 0.0f, 0, &denoiseAmount) ||
+            !parseFloatArgument(argv[5], "contrast", 0.0f, 0, &contrastFactor)) {
+            fprintf(stderr, "\n");
+            printUsage(stderr, argv[0]);
+            return 1;
+        }
+    }
+
+    if (!initializeCudaOrReport()) {
+        return 1;
     }
     
     // Load gambar
@@ -221,6 +359,7 @@ int main(int argc, char** argv) {
     printf("  Ukuran: %d x %d pixels\n", width, height);
     printf("  Channel: %d (%s)\n", channels, 
            channels == 1 ? "Grayscale" : 
+           channels == 2 ? "Grayscale + Alpha" :
            channels == 3 ? "RGB" : 
            channels == 4 ? "RGBA" : "Unknown");
     printf("  Total pixels: %d\n\n", width * height);
@@ -277,4 +416,3 @@ int main(int argc, char** argv) {
     
     return 0;
 }
-
